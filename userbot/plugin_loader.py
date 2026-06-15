@@ -1,13 +1,15 @@
-"""GitHub-dan runtime plugin yükləyici."""
+"""GitHub plugin loader with local cache + fallback support."""
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import sys
 import traceback
 import types
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -33,9 +35,29 @@ _loaded_records: dict[str, PluginRecord] = {}
 _sync_lock = asyncio.Lock()
 _sync_task: asyncio.Task | None = None
 
+_CACHE_VERSION = 1
+_CACHE_MANIFEST = "manifest.json"
+
 
 class PluginLoaderError(RuntimeError):
     pass
+
+
+@dataclass(slots=True)
+class CachedPlugin:
+    name: str
+    sha: str
+    source_url: str
+    cache_path: Path
+
+
+@dataclass(slots=True)
+class SyncSummary:
+    source: str
+    loaded_names: list[str]
+    failed_names: list[str]
+    remote_attempted: bool = False
+    remote_error: str = ""
 
 
 def preprocess_code(code: str) -> str:
@@ -71,6 +93,148 @@ def _headers() -> dict[str, str]:
     if Config.GITHUB_TOKEN:
         headers["Authorization"] = f"Bearer {Config.GITHUB_TOKEN}"
     return headers
+
+
+def _cache_root() -> Path:
+    path = Path(Config.PLUGIN_CACHE_DIR).expanduser()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _plugins_cache_dir() -> Path:
+    path = _cache_root() / "plugins"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _manifest_path() -> Path:
+    return _cache_root() / _CACHE_MANIFEST
+
+
+def _safe_stem(name: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_\-]", "_", name).strip("_") or "plugin"
+
+
+def _cache_file_path(name: str) -> Path:
+    return _plugins_cache_dir() / f"{_safe_stem(name)}.py"
+
+
+def cache_exists() -> bool:
+    manifest = _manifest_path()
+    if not manifest.exists():
+        return False
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    for item in data.get("plugins", []):
+        name = item.get("name", "")
+        if not name:
+            continue
+        if _cache_file_path(name).exists():
+            return True
+    return False
+
+
+def _read_manifest() -> dict[str, Any]:
+    path = _manifest_path()
+    if not path.exists():
+        return {"version": _CACHE_VERSION, "plugins": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.warning("Plugin cache manifest oxunmadı: %s", exc)
+        return {"version": _CACHE_VERSION, "plugins": []}
+    if not isinstance(data, dict):
+        return {"version": _CACHE_VERSION, "plugins": []}
+    plugins = data.get("plugins")
+    if not isinstance(plugins, list):
+        data["plugins"] = []
+    return data
+
+
+def _write_manifest(data: dict[str, Any]) -> None:
+    path = _manifest_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": _CACHE_VERSION,
+        "repo": Config.PLUGIN_SOURCE_REPO,
+        "branch": Config.PLUGIN_SOURCE_BRANCH,
+        "path": Config.PLUGIN_SOURCE_PATH,
+        "plugins": data.get("plugins", []),
+        "updated_at": data.get("updated_at"),
+    }
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _load_cached_catalog() -> list[CachedPlugin]:
+    manifest = _read_manifest()
+    allowlist = {name.lower() for name in Config.PLUGIN_ALLOWLIST}
+    cached: list[CachedPlugin] = []
+    for item in manifest.get("plugins", []):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip()
+        if not name:
+            continue
+        if allowlist and name.lower() not in allowlist:
+            continue
+        cache_path = _cache_file_path(name)
+        if not cache_path.exists():
+            log.warning("Cache faylı tapılmadı, keçilir: %s", cache_path)
+            continue
+        cached.append(
+            CachedPlugin(
+                name=name,
+                sha=str(item.get("sha", "cache")),
+                source_url=str(item.get("source_url") or cache_path.as_uri()),
+                cache_path=cache_path,
+            )
+        )
+    return cached
+
+
+def _persist_remote_catalog(plugins: list[dict[str, str]], plugin_code_map: dict[str, str]) -> list[CachedPlugin]:
+    manifest_plugins: list[dict[str, str]] = []
+    cached_plugins: list[CachedPlugin] = []
+    desired_names = {item["name"] for item in plugins}
+
+    for name, code in plugin_code_map.items():
+        cache_path = _cache_file_path(name)
+        cache_path.write_text(code, encoding="utf-8")
+
+    for item in plugins:
+        name = item["name"]
+        cache_path = _cache_file_path(name)
+        if not cache_path.exists():
+            continue
+        manifest_plugins.append(
+            {
+                "name": name,
+                "sha": item.get("sha", ""),
+                "source_url": item.get("download_url", "") or cache_path.as_uri(),
+            }
+        )
+        cached_plugins.append(
+            CachedPlugin(
+                name=name,
+                sha=item.get("sha", ""),
+                source_url=item.get("download_url", "") or cache_path.as_uri(),
+                cache_path=cache_path,
+            )
+        )
+
+    for old_file in _plugins_cache_dir().glob("*.py"):
+        if old_file.stem not in {_safe_stem(name) for name in desired_names}:
+            try:
+                old_file.unlink()
+            except Exception:
+                pass
+
+    _write_manifest({"plugins": manifest_plugins})
+    return cached_plugins
 
 
 async def _fetch_catalog() -> list[dict[str, str]]:
@@ -178,45 +342,94 @@ async def _unload_plugin(name: str, client) -> None:
     log.info("🗑 Plugin unload edildi: %s", name)
 
 
-async def sync_plugins(client) -> None:
+async def _reconcile_cached_plugins(cached_plugins: list[CachedPlugin], client, source: str) -> SyncSummary:
+    desired = {item.name: item for item in cached_plugins}
+    loaded_names: list[str] = []
+    failed_names: list[str] = []
+
+    for name in list(_loaded_records):
+        if name not in desired:
+            await _unload_plugin(name, client)
+
+    for name, item in desired.items():
+        current = _loaded_records.get(name)
+        if current and current.sha == item.sha:
+            loaded_names.append(name)
+            continue
+        if current:
+            await _unload_plugin(name, client)
+        try:
+            code = item.cache_path.read_text(encoding="utf-8")
+            await _load_plugin(name, item.sha, item.source_url, code, client)
+            loaded_names.append(name)
+        except Exception as exc:
+            failed_names.append(name)
+            log.error("Plugin yüklənmədi %s (%s): %s", name, source, exc)
+
+    log.info("🔌 Aktiv plugin sayı (%s): %s", source, len(_loaded_records))
+    return SyncSummary(source=source, loaded_names=sorted(loaded_names), failed_names=sorted(failed_names))
+
+
+async def _download_and_cache_from_github() -> list[CachedPlugin]:
+    plugins = await _fetch_catalog()
+    code_map: dict[str, str] = {}
+    for item in plugins:
+        download_url = item.get("download_url", "")
+        if not download_url:
+            raise PluginLoaderError(f"download_url boşdur: {item['name']}")
+        code_map[item["name"]] = await _fetch_code(download_url)
+    return _persist_remote_catalog(plugins, code_map)
+
+
+async def sync_plugins(client, *, force_remote: bool = False) -> SyncSummary:
     async with _sync_lock:
-        catalog = await _fetch_catalog()
-        desired = {item["name"]: item for item in catalog}
+        has_cache = cache_exists()
+        use_remote = force_remote or not has_cache
 
-        for name in list(_loaded_records):
-            if name not in desired:
-                await _unload_plugin(name, client)
-
-        for name, item in desired.items():
-            current = _loaded_records.get(name)
-            if current and current.sha == item["sha"]:
-                continue
-            if current:
-                await _unload_plugin(name, client)
-            code = await _fetch_code(item["download_url"])
+        if use_remote:
             try:
-                await _load_plugin(name, item["sha"], item["download_url"], code, client)
-            except PluginLoaderError as exc:
-                log.error("Plugin yüklənmədi %s: %s", name, exc)
+                cached_plugins = await _download_and_cache_from_github()
+                summary = await _reconcile_cached_plugins(cached_plugins, client, "github")
+                summary.remote_attempted = True
+                return summary
+            except Exception as exc:
+                remote_error = str(exc)
+                if has_cache:
+                    log.warning("GitHub sync xətası, cache istifadə olunur: %s", remote_error)
+                else:
+                    log.warning("GitHub sync xətası, cache yoxdur: %s", remote_error)
+                cached_plugins = _load_cached_catalog()
+                summary = await _reconcile_cached_plugins(cached_plugins, client, "cache-fallback")
+                summary.remote_attempted = True
+                summary.remote_error = remote_error
+                return summary
 
-        log.info("🔌 Aktiv GitHub plugin sayı: %s", len(_loaded_records))
+        cached_plugins = _load_cached_catalog()
+        return await _reconcile_cached_plugins(cached_plugins, client, "cache")
 
 
 async def load_all(client):
-    await sync_plugins(client)
+    return await sync_plugins(client, force_remote=False)
+
+
+async def manual_update(client):
+    return await sync_plugins(client, force_remote=True)
 
 
 async def _sync_loop(client):
     while True:
         await asyncio.sleep(Config.PLUGIN_SYNC_INTERVAL)
         try:
-            await sync_plugins(client)
+            await sync_plugins(client, force_remote=True)
         except Exception as exc:
             log.warning("Plugin sync xətası: %s", exc)
 
 
 async def start_background_sync(client):
     global _sync_task
+    if not Config.PLUGIN_AUTO_SYNC:
+        log.info("ℹ️ Avtomatik GitHub plugin sync söndürülüb")
+        return None
     if _sync_task and not _sync_task.done():
         return _sync_task
     _sync_task = asyncio.create_task(_sync_loop(client))
