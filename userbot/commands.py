@@ -7,6 +7,7 @@ import os
 import random
 import sys
 import time
+from dataclasses import dataclass
 from typing import Iterable
 
 from telethon import Button, events
@@ -16,7 +17,7 @@ from telethon.tl.functions.channels import EditBannedRequest
 from telethon.tl.functions.contacts import BlockRequest, UnblockRequest
 from telethon.tl.functions.photos import DeletePhotosRequest, GetUserPhotosRequest, UploadProfilePhotoRequest
 from telethon.tl.functions.users import GetFullUserRequest
-from telethon.tl.types import ChatBannedRights
+from telethon.tl.types import ChatBannedRights, MessageEntityMentionName
 
 from config import Config
 import db
@@ -32,22 +33,25 @@ MIN_TAG_DELAY = 1
 MAX_TAG_DELAY = 10
 
 
+@dataclass(slots=True)
 class TagMode:
-    def __init__(self, key: str, title: str, chunk_size: int, max_users: int, header: str = ""):
-        self.key = key
-        self.title = title
-        self.chunk_size = chunk_size
-        self.max_users = max_users
-        self.header = header
+    key: str
+    title: str
+    chunk_size: int
+    max_users: int | None = None
+    header: str = ""
 
 
 TAG_MODES: dict[str, TagMode] = {
-    "solo": TagMode("solo", "Tək-tək", 1, 15, "🎯 Tək tag"),
-    "trio": TagMode("trio", "3-lü", 3, 30, "⚡ 3-lü tag"),
-    "five": TagMode("five", "5-li", 5, 50, "🔥 5-li tag"),
-    "wave": TagMode("wave", "Dalğa", 8, 40, "🌊 Dalğa tag"),
-    "random": TagMode("random", "Random", 4, 20, "🎲 Random tag"),
+    "solo": TagMode("solo", "Tək-tək", 1, None, "🎯 Tək tag"),
+    "trio": TagMode("trio", "3-lü", 3, None, "⚡ 3-lü tag"),
+    "five": TagMode("five", "5-li", 5, None, "🔥 5-li tag"),
+    "wave": TagMode("wave", "Dalğa", 8, None, "🌊 Dalğa tag"),
+    "random": TagMode("random", "Random", 4, None, "🎲 Random tag"),
 }
+
+
+TAG_RUNS: dict[int, dict[str, object]] = {}
 
 
 def cmd_re(name: str) -> str:
@@ -113,17 +117,35 @@ def _tag_buttons() -> list[list[Button]]:
     ]
 
 
-def _build_mentions(users: Iterable, *, chunk_size: int) -> list[str]:
-    chunk: list[str] = []
-    messages: list[str] = []
+def _chunk_users(users: Iterable, chunk_size: int):
+    chunk = []
     for user in users:
-        chunk.append(f"<a href='tg://user?id={user.id}'>{user.first_name or 'user'}</a>")
+        chunk.append(user)
         if len(chunk) >= chunk_size:
-            messages.append(" ".join(chunk))
+            yield chunk
             chunk = []
     if chunk:
-        messages.append(" ".join(chunk))
-    return messages
+        yield chunk
+
+
+def _display_name(user) -> str:
+    return (getattr(user, "first_name", None) or getattr(user, "username", None) or "user").strip() or "user"
+
+
+def _build_mention_entities(users: Iterable, *, prefix: str = "") -> tuple[str, list[MessageEntityMentionName]]:
+    parts: list[str] = []
+    entities: list[MessageEntityMentionName] = []
+    current_offset = len(prefix)
+    for idx, user in enumerate(users):
+        if idx:
+            sep = " • "
+            parts.append(sep)
+            current_offset += len(sep)
+        name = _display_name(user)
+        parts.append(name)
+        entities.append(MessageEntityMentionName(offset=current_offset, length=len(name), user_id=user.id))
+        current_offset += len(name)
+    return "".join(parts), entities
 
 
 def _parse_tag_args(raw: str, default_delay: int) -> tuple[str, int]:
@@ -151,39 +173,128 @@ def _parse_tag_args(raw: str, default_delay: int) -> tuple[str, int]:
     return mode_key, delay
 
 
-async def _run_tag_mode(event, mode_key: str, delay_seconds: int):
-    mode = TAG_MODES[mode_key]
-    delay_seconds = max(MIN_TAG_DELAY, min(MAX_TAG_DELAY, int(delay_seconds)))
+def _start_tag_run(chat_id: int, sender_id: int) -> int:
+    run_id = time.monotonic_ns()
+    TAG_RUNS[chat_id] = {"run_id": run_id, "sender_id": sender_id, "stop": False}
+    return run_id
+
+
+def _get_tag_run(chat_id: int):
+    return TAG_RUNS.get(chat_id)
+
+
+def _request_tag_stop(chat_id: int) -> bool:
+    state = TAG_RUNS.get(chat_id)
+    if not state:
+        return False
+    state["stop"] = True
+    return True
+
+
+def _clear_tag_run(chat_id: int, run_id: int):
+    state = TAG_RUNS.get(chat_id)
+    if state and state.get("run_id") == run_id:
+        TAG_RUNS.pop(chat_id, None)
+
+
+def _tag_is_stopped(chat_id: int, run_id: int) -> bool:
+    state = TAG_RUNS.get(chat_id)
+    if not state or state.get("run_id") != run_id:
+        return True
+    return bool(state.get("stop"))
+
+
+async def _wait_with_stop(chat_id: int, run_id: int, seconds: int) -> bool:
+    end = time.monotonic() + max(0, seconds)
+    while time.monotonic() < end:
+        if _tag_is_stopped(chat_id, run_id):
+            return False
+        await asyncio.sleep(min(0.5, max(0.0, end - time.monotonic())))
+    return not _tag_is_stopped(chat_id, run_id)
+
+
+async def _collect_tag_members(event, mode: TagMode):
+    me = await event.client.get_me()
     members = []
-    async for user in event.client.iter_participants(event.chat_id, limit=mode.max_users * 3):
-        if user.bot or user.deleted:
+    async for user in event.client.iter_participants(event.chat_id, limit=None):
+        if user.bot or user.deleted or user.id == me.id:
             continue
         members.append(user)
+    if mode.key == "random":
+        random.shuffle(members)
+    if mode.max_users:
+        members = members[: mode.max_users]
+    return members
+
+
+async def _run_tag_mode(event, mode_key: str, delay_seconds: int, reason_text: str = ""):
+    mode = TAG_MODES[mode_key]
+    delay_seconds = max(MIN_TAG_DELAY, min(MAX_TAG_DELAY, int(delay_seconds)))
+    members = await _collect_tag_members(event, mode)
 
     if not members:
         return await edit_safe(event, "⚠️ Tag üçün uyğun istifadəçi tapılmadı.")
 
-    if mode.key == "random":
-        random.shuffle(members)
-    members = members[: mode.max_users]
-    messages = _build_mentions(members, chunk_size=mode.chunk_size)
+    run_id = _start_tag_run(event.chat_id, event.sender_id)
+    batches = list(_chunk_users(members, mode.chunk_size))
+    stopped = False
+    last_sent_index = 0
 
     try:
-        await event.delete()
-    except Exception:
-        pass
-
-    for idx, message in enumerate(messages, start=1):
-        prefix = mode.header
-        if mode.key == "wave":
-            prefix = f"{mode.header} #{idx}"
-        text = f"{prefix} • {delay_seconds}s\n{message}" if prefix else message
         try:
-            await event.client.send_message(event.chat_id, text, parse_mode="html")
-        except FloodWaitError as exc:
-            await asyncio.sleep(exc.seconds + 1)
-            await event.client.send_message(event.chat_id, text, parse_mode="html")
-        await asyncio.sleep(delay_seconds)
+            await event.delete()
+        except Exception:
+            pass
+
+        for idx, batch in enumerate(batches, start=1):
+            if _tag_is_stopped(event.chat_id, run_id):
+                stopped = True
+                break
+
+            header = mode.header
+            if mode.key == "wave":
+                header = f"{mode.header} #{idx}"
+
+            lines = []
+            if header:
+                lines.append(f"{header} • {delay_seconds}s")
+            if reason_text:
+                lines.append(f"📝 Səbəb: {reason_text}")
+            prefix = ("\n".join(lines) + "\n") if lines else ""
+            names_text, entities = _build_mention_entities(batch, prefix=prefix)
+            payload = prefix + names_text
+
+            try:
+                await event.client.send_message(
+                    event.chat_id,
+                    payload,
+                    formatting_entities=entities,
+                    link_preview=False,
+                )
+            except FloodWaitError as exc:
+                if not await _wait_with_stop(event.chat_id, run_id, exc.seconds + 1):
+                    stopped = True
+                    break
+                await event.client.send_message(
+                    event.chat_id,
+                    payload,
+                    formatting_entities=entities,
+                    link_preview=False,
+                )
+
+            last_sent_index = idx
+            if idx < len(batches) and not await _wait_with_stop(event.chat_id, run_id, delay_seconds):
+                stopped = True
+                break
+    finally:
+        _clear_tag_run(event.chat_id, run_id)
+
+    status_text = (
+        f"🛑 Tag prosesi dayandırıldı. Göndərilən hissə: <code>{last_sent_index}/{len(batches)}</code>"
+        if stopped
+        else f"✅ Tag tamamlandı. Ümumi istifadəçi: <code>{len(members)}</code>"
+    )
+    await event.client.send_message(event.chat_id, status_text, parse_mode="html", link_preview=False)
 
 
 def register(client):
@@ -228,7 +339,7 @@ def register(client):
             "🔨 Moderasiya:\n"
             "<code>.ban</code> | <code>.unban</code> | <code>.mute</code> | <code>.block</code> | <code>.unblock</code>\n\n"
             "👤 İstifadəçi & Qrup:\n"
-            f"<code>.info</code> | <code>.tag [mod] [1-10]</code> | <code>.tagtime {current_delay}</code> | <code>.setwelcome</code>\n\n"
+            f"<code>.info</code> | <code>.tag [mod] [1-10]</code> | <code>.tagsebeb səbəb | mod 1-10</code> | <code>.stop</code> | <code>.tagtime {current_delay}</code> | <code>.setwelcome</code>\n\n"
             "🧬 Profil:\n"
             "<code>.klon</code> | <code>.unklon</code>\n\n"
             f"🔌 Aktiv Pluginlər ({len(plugins)}):\n"
@@ -371,11 +482,54 @@ def register(client):
             return await edit_safe(event, "⚠️ Tag intervalı 1-10 saniyə aralığında olmalıdır.")
         saved_delay = await _set_tag_delay(delay)
         await edit_safe(event, f"✅ Tag intervalı <code>{saved_delay}</code> saniyə olaraq yadda saxlanıldı.")
+    @client.on(events.NewMessage(outgoing=True, pattern=cmd_re("stop")))
+    async def stop_tag(event):
+        if not event.is_group:
+            return await edit_safe(event, "⚠️ Yalnız qruplarda işləyir.")
+        if _request_tag_stop(event.chat_id):
+            await edit_safe(event, "🛑 Aktiv tag prosesi dayandırılacaq.")
+        else:
+            await edit_safe(event, "ℹ️ Aktiv tag prosesi yoxdur.")
+
+    @client.on(events.NewMessage(outgoing=True, pattern=cmd_re("tagsebeb")))
+    async def tag_reason(event):
+        if not event.is_group:
+            return await edit_safe(event, "⚠️ Yalnız qruplarda işləyir.")
+        if _get_tag_run(event.chat_id):
+            return await edit_safe(event, "⚠️ Hazırda aktiv tag prosesi var. Dayandırmaq üçün <code>.stop</code> yazın.")
+        if not await tag_rl_check(event.sender_id):
+            return await edit_safe(event, "⏳ .tagsebeb üçün 2 saniyə gözləyin.")
+
+        raw = event.pattern_match.group(1).strip()
+        if not raw:
+            return await edit_safe(
+                event,
+                (
+                    f"ℹ️ İstifadə: <code>{P}tagsebeb səbəb mətni</code>\n"
+                    f"Opsional: <code>{P}tagsebeb səbəb mətni | trio 3</code>"
+                ),
+            )
+
+        reason_text = raw
+        mode_key = "solo"
+        delay = await _get_tag_delay()
+        if "|" in raw:
+            reason_text, options = [part.strip() for part in raw.split("|", 1)]
+            mode_key, delay = _parse_tag_args(options.lower(), delay)
+        if not reason_text:
+            return await edit_safe(event, "⚠️ Səbəb mətni boş ola bilməz.")
+        if mode_key not in TAG_MODES:
+            return await edit_safe(event, "⚠️ Mövcud modlar: solo, trio, five, wave, random")
+        if delay < MIN_TAG_DELAY or delay > MAX_TAG_DELAY:
+            return await edit_safe(event, "⚠️ Tag intervalı 1-10 saniyə aralığında olmalıdır.")
+        await _run_tag_mode(event, mode_key, delay, reason_text=reason_text)
 
     @client.on(events.NewMessage(outgoing=True, pattern=cmd_re("tag")))
     async def tag(event):
         if not event.is_group:
             return await edit_safe(event, "⚠️ Yalnız qruplarda işləyir.")
+        if _get_tag_run(event.chat_id):
+            return await edit_safe(event, "⚠️ Hazırda aktiv tag prosesi var. Dayandırmaq üçün <code>.stop</code> yazın.")
         if not await tag_rl_check(event.sender_id):
             return await edit_safe(event, "⏳ .tag üçün 2 saniyə gözləyin.")
 
@@ -385,13 +539,13 @@ def register(client):
             menu = (
                 "🏷 <b>Tag menu</b>\n"
                 "━━━━━━━━━━━━━━━\n"
-                "1. Solo — tək-tək mention\n"
-                "2. Trio — 3 nəfərlik qruplar\n"
-                "3. Five — 5 nəfərlik qruplar\n"
-                "4. Wave — dalğa formasında böyük qruplar\n"
-                "5. Random — qarışıq 20 nəfər\n\n"
+                "1. Solo — hamını tək-tək mention edir\n"
+                "2. Trio — 3 nəfərlik qruplarla mention edir\n"
+                "3. Five — 5 nəfərlik qruplarla mention edir\n"
+                "4. Wave — dalğa formasında bütün üzvləri mention edir\n"
+                "5. Random — üzvləri qarışıq sıra ilə mention edir\n\n"
                 f"Cari interval: <code>{default_delay}</code> saniyə\n"
-                f"İstifadə: <code>{P}tag solo 3</code>, <code>{P}tag 5</code>, <code>{P}tagtime 4</code>"
+                f"İstifadə: <code>{P}tag solo 3</code>, <code>{P}tag 5</code>, <code>{P}tagsebeb iclas var | trio 3</code>, <code>{P}stop</code>, <code>{P}tagtime 4</code>"
             )
             return await edit_safe(event, menu, buttons=_tag_buttons())
 
@@ -404,6 +558,8 @@ def register(client):
 
     @client.on(events.CallbackQuery(pattern=rb"^tag:(solo|trio|five|wave|random)$"))
     async def tag_callback(event):
+        if _get_tag_run(event.chat_id):
+            return await event.answer("Aktiv tag prosesi var. Dayandırmaq üçün .stop istifadə edin", alert=True)
         if not await tag_rl_check(event.sender_id):
             return await event.answer("2 saniyə gözləyin", alert=True)
         delay = await _get_tag_delay()
