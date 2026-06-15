@@ -1442,7 +1442,7 @@ def register(bot, prefix="."):
         dt = _fmt_uptime(time.time() - AFK_STATE["since"])
         await e.reply(f"💤 <b>AFK</b>\n📝 {h_escape(AFK_STATE['reason'])}\n⏱ {dt}", parse_mode="html")
 
-    @bot.on(cmd("tag"))
+    @bot.on(cmd("hakakaka"))
     async def _tag(e):
         t = e.pattern_match.group(1) or "‏‏‎ ‎"
         if not e.is_reply: return await _info(e, "tag", ".tag <mətn> (reply)", "Reply'ə görünməz tag.", ".tag salam")
@@ -1450,7 +1450,7 @@ def register(bot, prefix="."):
         await e.delete()
         await e.client.send_message(e.chat_id, f"[‎](tg://user?id={r.sender_id}){t}", parse_mode="md")
 
-    @bot.on(cmd("tagall"))
+    @bot.on(cmd("hahahaha"))
     async def _tagall(e):
         t = e.pattern_match.group(1) or "Hamı"
         try:
