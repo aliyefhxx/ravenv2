@@ -597,39 +597,49 @@ def register(client):
             return await edit_safe(event, f"ℹ️ İstifadə: <code>{P}klon</code> (reply və ya id)")
         await edit_safe(event, "🧬 Klonlanır...")
         me = await event.client.get_me()
-        full_me = await event.client(GetFullUserRequest(me.id))
-        photo_bytes = b""
-        try:
-            buf = io.BytesIO()
-            await event.client.download_profile_photo("me", file=buf)
-            photo_bytes = buf.getvalue()
-        except Exception:
-            pass
+        existing_snapshot = await db.get_clone(me.id)
+        if existing_snapshot is None:
+            full_me = await event.client(GetFullUserRequest(me.id))
+            photo_bytes = b""
+            try:
+                buf = io.BytesIO()
+                await event.client.download_profile_photo("me", file=buf)
+                photo_bytes = buf.getvalue()
+            except Exception:
+                pass
 
-        await db.save_clone(
-            me.id,
-            me.first_name or "",
-            me.last_name or "",
-            full_me.full_user.about or "",
-            photo_bytes,
-        )
+            await db.save_clone(
+                me.id,
+                me.first_name or "",
+                me.last_name or "",
+                full_me.full_user.about or "",
+                photo_bytes,
+            )
 
         target_full = await event.client(GetFullUserRequest(ent.id))
+        target_name = (getattr(ent, "first_name", None) or getattr(ent, "username", None) or str(ent.id)).strip()
         try:
             await event.client(
                 UpdateProfileRequest(
-                    first_name=ent.first_name or "",
+                    first_name=ent.first_name or "‎",
                     last_name=ent.last_name or "",
                     about=(target_full.full_user.about or "")[:70],
                 )
             )
-            buf = io.BytesIO()
-            await event.client.download_profile_photo(ent.id, file=buf)
-            buf.seek(0)
-            if buf.getvalue():
-                file = await event.client.upload_file(buf, file_name="klon.jpg")
+
+            target_photo = io.BytesIO()
+            await event.client.download_profile_photo(ent, file=target_photo)
+            target_photo.seek(0)
+
+            current_photos = await event.client(GetUserPhotosRequest("me", offset=0, max_id=0, limit=10))
+            if current_photos.photos:
+                await event.client(DeletePhotosRequest(list(current_photos.photos)))
+
+            if target_photo.getvalue():
+                file = await event.client.upload_file(target_photo, file_name="klon.jpg")
                 await event.client(UploadProfilePhotoRequest(file))
-            await edit_safe(event, f"✅ Klonlama tamamlandı: {ent.first_name}")
+
+            await edit_safe(event, f"✅ Klonlama tamamlandı: {target_name}")
         except FloodWaitError as exc:
             await edit_safe(event, f"⏳ FloodWait: {exc.seconds} saniyə gözləyin")
         except Exception as exc:
@@ -644,14 +654,14 @@ def register(client):
         try:
             await event.client(
                 UpdateProfileRequest(
-                    first_name=row.original_first or "",
+                    first_name=row.original_first or "‎",
                     last_name=row.original_last or "",
                     about=row.original_bio or "",
                 )
             )
-            photos = await event.client(GetUserPhotosRequest(me.id, offset=0, max_id=0, limit=1))
+            photos = await event.client(GetUserPhotosRequest("me", offset=0, max_id=0, limit=10))
             if photos.photos:
-                await event.client(DeletePhotosRequest([photos.photos[0]]))
+                await event.client(DeletePhotosRequest(list(photos.photos)))
             if row.original_photo:
                 buf = io.BytesIO(row.original_photo)
                 file = await event.client.upload_file(buf, file_name="orig.jpg")
