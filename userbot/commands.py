@@ -27,24 +27,26 @@ log = logging.getLogger("cmds")
 P = Config.CMD_PREFIX
 START_TIME = time.time()
 TAG_CALLBACK_PREFIX = b"tag:"
+DEFAULT_TAG_DELAY = 2
+MIN_TAG_DELAY = 1
+MAX_TAG_DELAY = 10
 
 
 class TagMode:
-    def __init__(self, key: str, title: str, chunk_size: int, max_users: int, delay: float, header: str = ""):
+    def __init__(self, key: str, title: str, chunk_size: int, max_users: int, header: str = ""):
         self.key = key
         self.title = title
         self.chunk_size = chunk_size
         self.max_users = max_users
-        self.delay = delay
         self.header = header
 
 
 TAG_MODES: dict[str, TagMode] = {
-    "solo": TagMode("solo", "Tək-tək", 1, 15, 0.6, "🎯 Tək tag"),
-    "trio": TagMode("trio", "3-lü", 3, 30, 0.8, "⚡ 3-lü tag"),
-    "five": TagMode("five", "5-li", 5, 50, 1.0, "🔥 5-li tag"),
-    "wave": TagMode("wave", "Dalğa", 8, 40, 1.2, "🌊 Dalğa tag"),
-    "random": TagMode("random", "Random", 4, 20, 0.9, "🎲 Random tag"),
+    "solo": TagMode("solo", "Tək-tək", 1, 15, "🎯 Tək tag"),
+    "trio": TagMode("trio", "3-lü", 3, 30, "⚡ 3-lü tag"),
+    "five": TagMode("five", "5-li", 5, 50, "🔥 5-li tag"),
+    "wave": TagMode("wave", "Dalğa", 8, 40, "🌊 Dalğa tag"),
+    "random": TagMode("random", "Random", 4, 20, "🎲 Random tag"),
 }
 
 
@@ -88,6 +90,21 @@ async def get_target_user(event):
         return None, None
 
 
+async def _get_tag_delay() -> int:
+    raw = await db.get_setting("tag_delay", str(DEFAULT_TAG_DELAY))
+    try:
+        delay = int(str(raw).strip())
+    except (TypeError, ValueError):
+        delay = DEFAULT_TAG_DELAY
+    return max(MIN_TAG_DELAY, min(MAX_TAG_DELAY, delay))
+
+
+async def _set_tag_delay(delay: int) -> int:
+    safe_delay = max(MIN_TAG_DELAY, min(MAX_TAG_DELAY, int(delay)))
+    await db.set_setting("tag_delay", str(safe_delay))
+    return safe_delay
+
+
 def _tag_buttons() -> list[list[Button]]:
     return [
         [Button.inline("🎯 Solo", b"tag:solo"), Button.inline("⚡ Trio", b"tag:trio")],
@@ -109,8 +126,34 @@ def _build_mentions(users: Iterable, *, chunk_size: int) -> list[str]:
     return messages
 
 
-async def _run_tag_mode(event, mode_key: str):
+def _parse_tag_args(raw: str, default_delay: int) -> tuple[str, int]:
+    parts = [part for part in raw.split() if part]
+    if not parts:
+        return "", default_delay
+
+    aliases = {
+        "mention": "solo",
+        "1": "solo",
+        "3": "trio",
+        "5": "five",
+    }
+
+    mode_key = "solo"
+    delay = default_delay
+
+    if len(parts) == 1 and parts[0].isdigit():
+        delay = int(parts[0])
+        return mode_key, delay
+
+    mode_key = aliases.get(parts[0].lower(), parts[0].lower())
+    if len(parts) >= 2 and parts[1].isdigit():
+        delay = int(parts[1])
+    return mode_key, delay
+
+
+async def _run_tag_mode(event, mode_key: str, delay_seconds: int):
     mode = TAG_MODES[mode_key]
+    delay_seconds = max(MIN_TAG_DELAY, min(MAX_TAG_DELAY, int(delay_seconds)))
     members = []
     async for user in event.client.iter_participants(event.chat_id, limit=mode.max_users * 3):
         if user.bot or user.deleted:
@@ -134,13 +177,13 @@ async def _run_tag_mode(event, mode_key: str):
         prefix = mode.header
         if mode.key == "wave":
             prefix = f"{mode.header} #{idx}"
-        text = f"{prefix}\n{message}" if prefix else message
+        text = f"{prefix} • {delay_seconds}s\n{message}" if prefix else message
         try:
             await event.client.send_message(event.chat_id, text, parse_mode="html")
         except FloodWaitError as exc:
             await asyncio.sleep(exc.seconds + 1)
             await event.client.send_message(event.chat_id, text, parse_mode="html")
-        await asyncio.sleep(mode.delay)
+        await asyncio.sleep(delay_seconds)
 
 
 def register(client):
@@ -176,22 +219,44 @@ def register(client):
     @client.on(events.NewMessage(outgoing=True, pattern=cmd_re("help")))
     async def help_cmd(event):
         plugins = list(plugin_loader.loaded.keys())
+        current_delay = await _get_tag_delay()
         text = (
             "Raven Userbot\n"
             "━━━━━━━━━━━━━━━\n"
             "🛡 İdarəetmə:\n"
-            "<code>.alive</code> | <code>.dlive</code> | <code>.restart</code>\n\n"
+            "<code>.alive</code> | <code>.dlive</code> | <code>.restart</code> | <code>.pluginsync</code>\n\n"
             "🔨 Moderasiya:\n"
             "<code>.ban</code> | <code>.unban</code> | <code>.mute</code> | <code>.block</code> | <code>.unblock</code>\n\n"
             "👤 İstifadəçi & Qrup:\n"
-            "<code>.info</code> | <code>.tag</code> | <code>.setwelcome</code>\n\n"
+            f"<code>.info</code> | <code>.tag [mod] [1-10]</code> | <code>.tagtime {current_delay}</code> | <code>.setwelcome</code>\n\n"
             "🧬 Profil:\n"
             "<code>.klon</code> | <code>.unklon</code>\n\n"
-            
-            
             f"🔌 Aktiv Pluginlər ({len(plugins)}):\n"
             f"{', '.join(plugins) if plugins else 'Yoxdur'}"
         )
+        await edit_safe(event, text)
+
+    @client.on(events.NewMessage(outgoing=True, pattern=cmd_re("pluginsync")))
+    async def pluginsync(event):
+        if not await rl_check(event, "pluginsync", limit=2, per=30):
+            return
+        await edit_safe(event, "🔄 Plugin cache GitHub üzərindən yenilənir...")
+        summary = await plugin_loader.manual_update(event.client)
+        if summary.remote_error:
+            text = (
+                "⚠️ GitHub yenilənməsi alınmadı, cache saxlanıldı.\n"
+                f"Mənbə: <code>{summary.source}</code>\n"
+                f"Aktiv pluginlər: <code>{len(summary.loaded_names)}</code>\n"
+                f"Xəta: <code>{summary.remote_error}</code>"
+            )
+        else:
+            text = (
+                "✅ Plugin cache yeniləndi.\n"
+                f"Mənbə: <code>{summary.source}</code>\n"
+                f"Aktiv pluginlər: <code>{len(summary.loaded_names)}</code>"
+            )
+        if summary.failed_names:
+            text += "\nYüklənməyənlər: " + ", ".join(summary.failed_names)
         await edit_safe(event, text)
 
     @client.on(events.NewMessage(outgoing=True, pattern=cmd_re("ban")))
@@ -289,6 +354,24 @@ def register(client):
         )
         await edit_safe(event, text)
 
+    @client.on(events.NewMessage(outgoing=True, pattern=cmd_re("tagtime")))
+    async def tagtime(event):
+        raw = event.pattern_match.group(1).strip()
+        if not raw or not raw.isdigit():
+            current_delay = await _get_tag_delay()
+            return await edit_safe(
+                event,
+                (
+                    f"ℹ️ İstifadə: <code>{P}tagtime 1-10</code>\n"
+                    f"Hazırkı interval: <code>{current_delay}</code> saniyə"
+                ),
+            )
+        delay = int(raw)
+        if delay < MIN_TAG_DELAY or delay > MAX_TAG_DELAY:
+            return await edit_safe(event, "⚠️ Tag intervalı 1-10 saniyə aralığında olmalıdır.")
+        saved_delay = await _set_tag_delay(delay)
+        await edit_safe(event, f"✅ Tag intervalı <code>{saved_delay}</code> saniyə olaraq yadda saxlanıldı.")
+
     @client.on(events.NewMessage(outgoing=True, pattern=cmd_re("tag")))
     async def tag(event):
         if not event.is_group:
@@ -296,6 +379,7 @@ def register(client):
         if not await tag_rl_check(event.sender_id):
             return await edit_safe(event, "⏳ .tag üçün 2 saniyə gözləyin.")
 
+        default_delay = await _get_tag_delay()
         raw = event.pattern_match.group(1).strip().lower()
         if not raw:
             menu = (
@@ -306,28 +390,26 @@ def register(client):
                 "3. Five — 5 nəfərlik qruplar\n"
                 "4. Wave — dalğa formasında böyük qruplar\n"
                 "5. Random — qarışıq 20 nəfər\n\n"
-                "Aşağıdakı düymələrdən seçin və ya <code>.tag solo</code> kimi yazın."
+                f"Cari interval: <code>{default_delay}</code> saniyə\n"
+                f"İstifadə: <code>{P}tag solo 3</code>, <code>{P}tag 5</code>, <code>{P}tagtime 4</code>"
             )
             return await edit_safe(event, menu, buttons=_tag_buttons())
 
-        aliases = {
-            "mention": "solo",
-            "1": "solo",
-            "3": "trio",
-            "5": "five",
-        }
-        mode_key = aliases.get(raw, raw)
+        mode_key, delay = _parse_tag_args(raw, default_delay)
         if mode_key not in TAG_MODES:
             return await edit_safe(event, "⚠️ Mövcud modlar: solo, trio, five, wave, random")
-        await _run_tag_mode(event, mode_key)
+        if delay < MIN_TAG_DELAY or delay > MAX_TAG_DELAY:
+            return await edit_safe(event, "⚠️ Tag intervalı 1-10 saniyə aralığında olmalıdır.")
+        await _run_tag_mode(event, mode_key, delay)
 
     @client.on(events.CallbackQuery(pattern=rb"^tag:(solo|trio|five|wave|random)$"))
     async def tag_callback(event):
         if not await tag_rl_check(event.sender_id):
             return await event.answer("2 saniyə gözləyin", alert=True)
+        delay = await _get_tag_delay()
         mode_key = event.data.decode().split(":", 1)[1]
-        await event.answer(f"{TAG_MODES[mode_key].title} başladı")
-        await _run_tag_mode(event, mode_key)
+        await event.answer(f"{TAG_MODES[mode_key].title} başladı • {delay}s")
+        await _run_tag_mode(event, mode_key, delay)
 
     @client.on(events.NewMessage(outgoing=True, pattern=cmd_re("setwelcome")))
     async def setwelcome(event):
