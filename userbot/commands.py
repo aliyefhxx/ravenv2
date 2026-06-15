@@ -304,10 +304,10 @@ def register(client):
             return
         uptime = int(time.time() - START_TIME)
         msg = await db.get_setting("alive_msg") or (
-            "✨ Raven Userbot \n"
+            "🇬🇪 Ryhavean Userbot \n"
             "━━━━━━━━━━━━━━━\n"
             "🤖 Sistem: <code>online</code>\n"
-            "⚡ Versiya: <code>2.0.0</code>\n"
+            "⚡ Versiya: <code>2.1.0</code>\n"
             f"⏱ Uptime: <code>{uptime}s</code>"
         )
         await edit_safe(event, msg)
