@@ -1,6 +1,7 @@
 """Mərkəzi konfiqurasiya"""
 import os
 from pathlib import Path
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -33,6 +34,26 @@ def _detect_repo_from_git() -> str:
     return ""
 
 
+def _default_plugin_cache_dir() -> str:
+    candidates = [
+        os.getenv("PLUGIN_CACHE_DIR", "").strip(),
+        os.getenv("RENDER_DISK_PATH", "").strip(),
+        os.getenv("RENDER_PERSISTENT_DIR", "").strip(),
+    ]
+    for candidate in candidates:
+        if candidate:
+            base = Path(candidate).expanduser()
+            if base.name == "raven-plugin-cache":
+                return str(base)
+            return str(base / "raven-plugin-cache")
+
+    render_disk_fallback = Path("/var/data")
+    if render_disk_fallback.exists() and render_disk_fallback.is_dir():
+        return str(render_disk_fallback / "raven-plugin-cache")
+
+    return str((Path(__file__).resolve().parent / ".plugin_cache").resolve())
+
+
 class Config:
     API_ID = int(os.getenv("API_ID", "0"))
     API_HASH = os.getenv("API_HASH", "")
@@ -47,6 +68,8 @@ class Config:
     PLUGIN_SOURCE_PATH = os.getenv("PLUGIN_SOURCE_PATH", "github_plugins").strip("/")
     PLUGIN_SYNC_INTERVAL = max(60, int(os.getenv("PLUGIN_SYNC_INTERVAL", "300")))
     GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+    PLUGIN_CACHE_DIR = _default_plugin_cache_dir()
+    PLUGIN_AUTO_SYNC = os.getenv("PLUGIN_AUTO_SYNC", "0") == "1"
     PLUGIN_ALLOWLIST = [
         item.strip() for item in os.getenv("PLUGIN_ALLOWLIST", "").split(",") if item.strip()
     ]
