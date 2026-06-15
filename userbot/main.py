@@ -5,9 +5,10 @@ import asyncio
 import logging
 import os
 import sys
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 import emoji_utils  # noqa: F401
+import httpx
 import uvicorn
 from fastapi import FastAPI
 from telethon import TelegramClient
@@ -27,6 +28,7 @@ logging.basicConfig(
 log = logging.getLogger("raven")
 
 tg_client: TelegramClient | None = None
+keepalive_task: asyncio.Task | None = None
 
 
 def _install_extra_emoji_patches():
@@ -86,6 +88,57 @@ def get_session_string() -> str:
             log.critical("Session deşifrə xətası: %s", exc)
             sys.exit(1)
     return raw
+
+
+def _resolve_keepalive_url() -> str:
+    if Config.UPTIME_URL:
+        return Config.UPTIME_URL
+    if Config.APP_BASE_URL:
+        return f"{Config.APP_BASE_URL}/uptime"
+    return ""
+
+
+async def _keepalive_loop(url: str):
+    headers = {"User-Agent": Config.UPTIME_USER_AGENT}
+    timeout = httpx.Timeout(20.0)
+    async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
+        while True:
+            try:
+                response = await client.get(url)
+                log.info("Keepalive ping -> %s [%s]", url, response.status_code)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("Keepalive ping xətası (%s): %s", url, exc)
+            await asyncio.sleep(Config.UPTIME_INTERVAL_SECONDS)
+
+
+def start_keepalive_task() -> asyncio.Task | None:
+    global keepalive_task
+    if not Config.UPTIME_ENABLED:
+        log.info("ℹ️ Keepalive söndürülüb")
+        return None
+
+    url = _resolve_keepalive_url()
+    if not url:
+        log.info("ℹ️ Keepalive üçün APP_BASE_URL və ya UPTIME_URL təyin edilməyib")
+        return None
+
+    if keepalive_task and not keepalive_task.done():
+        return keepalive_task
+
+    log.info("🌐 Keepalive aktivdir: %s", url)
+    keepalive_task = asyncio.create_task(_keepalive_loop(url), name="raven-keepalive")
+    return keepalive_task
+
+
+async def stop_keepalive_task():
+    global keepalive_task
+    if keepalive_task and not keepalive_task.done():
+        keepalive_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await keepalive_task
+    keepalive_task = None
 
 
 async def post_restart_notice(client):
@@ -148,12 +201,19 @@ async def _userbot_runner():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    userbot_task = asyncio.create_task(_userbot_runner())
-    yield
-    plugin_loader.stop_background_sync()
-    userbot_task.cancel()
-    if tg_client and tg_client.is_connected():
-        await tg_client.disconnect()
+    userbot_task = asyncio.create_task(_userbot_runner(), name="raven-userbot")
+    start_keepalive_task()
+    try:
+        yield
+    finally:
+        plugin_loader.stop_background_sync()
+        await stop_keepalive_task()
+        userbot_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await userbot_task
+        if tg_client and tg_client.is_connected():
+            await tg_client.disconnect()
+        await db.close_db()
 
 
 app = FastAPI(title="Raven Userbot", version="2.0.0", lifespan=lifespan)
@@ -173,6 +233,16 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "healthy" if tg_client and tg_client.is_connected() else "starting"}
+
+
+@app.get("/uptime")
+async def uptime():
+    return {
+        "status": "ok",
+        "service": "raven-userbot",
+        "keepalive": Config.UPTIME_ENABLED,
+        "telegram_connected": bool(tg_client and tg_client.is_connected()),
+    }
 
 
 if __name__ == "__main__":
