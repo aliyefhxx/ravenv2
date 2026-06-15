@@ -1,0 +1,135 @@
+"""Raven Userbot - Render üçün yüngül web service entrypoint."""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import sys
+from contextlib import asynccontextmanager
+
+import emoji_utils  # noqa: F401
+import uvicorn
+from fastapi import FastAPI
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+
+from config import Config
+import commands
+import db
+import plugin_loader
+import quotly
+import security
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("raven")
+
+tg_client: TelegramClient | None = None
+
+
+def get_session_string() -> str:
+    raw = Config.SESSION_STRING
+    if not raw:
+        log.critical("SESSION_STRING env yoxdur")
+        sys.exit(1)
+    if raw.startswith("enc:"):
+        try:
+            return security.decrypt(raw[4:])
+        except Exception as exc:
+            log.critical("Session deşifrə xətası: %s", exc)
+            sys.exit(1)
+    return raw
+
+
+async def post_restart_notice(client):
+    chat = os.getenv("RESTART_CHAT")
+    mid = os.getenv("RESTART_MSG")
+    if not chat or not mid:
+        return
+    try:
+        await client.edit_message(int(chat), int(mid), "✅ <b>Restart tamamlandı</b>", parse_mode="html")
+    except Exception:
+        pass
+    os.environ.pop("RESTART_CHAT", None)
+    os.environ.pop("RESTART_MSG", None)
+
+
+async def start_userbot():
+    global tg_client
+    if not Config.API_ID or not Config.API_HASH:
+        raise RuntimeError("API_ID və API_HASH env-ləri tələb olunur")
+
+    await db.init_db()
+    tg_client = TelegramClient(
+        StringSession(get_session_string()),
+        Config.API_ID,
+        Config.API_HASH,
+        device_model="Raven Userbot",
+        system_version="render",
+        app_version="2.0.0",
+    )
+    await tg_client.start()
+    me = await tg_client.get_me()
+    log.info("✅ Daxil oldu: %s (@%s) id=%s", me.first_name, me.username, me.id)
+
+    commands.register(tg_client)
+    quotly.register_quotly(tg_client, CMD_PREFIX=Config.CMD_PREFIX)
+    await plugin_loader.load_all(tg_client)
+    await plugin_loader.start_background_sync(tg_client)
+    await post_restart_notice(tg_client)
+
+    if Config.LOG_TO_SAVED:
+        try:
+            await tg_client.send_message(
+                "me",
+                "✨ <b>Raven Userbot Come Back</b>",
+                parse_mode="html",
+            )
+        except Exception:
+            pass
+
+    await tg_client.run_until_disconnected()
+
+
+async def _userbot_runner():
+    try:
+        await start_userbot()
+    except Exception:
+        log.exception("Userbot kritik xəta")
+        os._exit(1)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    userbot_task = asyncio.create_task(_userbot_runner())
+    yield
+    plugin_loader.stop_background_sync()
+    userbot_task.cancel()
+    if tg_client and tg_client.is_connected():
+        await tg_client.disconnect()
+
+
+app = FastAPI(title="Raven Userbot", version="2.0.0", lifespan=lifespan)
+
+
+@app.get("/")
+async def root():
+    connected = bool(tg_client and tg_client.is_connected())
+    return {
+        "status": "ok",
+        "service": "raven-userbot",
+        "telegram_connected": connected,
+        "plugins_loaded": sorted(plugin_loader.loaded.keys()),
+    }
+
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy" if tg_client and tg_client.is_connected() else "starting"}
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
