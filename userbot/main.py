@@ -216,7 +216,12 @@ async def lifespan(app: FastAPI):
         await db.close_db()
 
 
-app = FastAPI(title="Raven Userbot", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="Raven Userbot", version="2.1.0", lifespan=lifespan)
+from fastapi.responses import PlainTextResponse
+
+@app.api_route("/uptime", methods=["GET", "HEAD"])
+async def uptime():
+    return PlainTextResponse("ok")
 
 
 @app.get("/")
