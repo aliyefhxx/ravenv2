@@ -187,10 +187,8 @@ def register(client):
             "<code>.info</code> | <code>.tag</code> | <code>.setwelcome</code>\n\n"
             "🧬 Profil:\n"
             "<code>.klon</code> | <code>.unklon</code>\n\n"
-            "🔌 Plugin sistemi: yalnız GitHub runtime sync\n"
-            f"Repo: <code>{Config.PLUGIN_SOURCE_REPO or 'təyin edilməyib'}</code>\n"
-            f"Path: <code>{Config.PLUGIN_SOURCE_PATH}</code>\n"
-            "━━━━━━━━━━━━━━━\n"
+            
+            
             f"🔌 Aktiv Pluginlər ({len(plugins)}):\n"
             f"{', '.join(plugins) if plugins else 'Yoxdur'}"
         )
