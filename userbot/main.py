@@ -219,20 +219,14 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Raven Userbot", version="2.1.0", lifespan=lifespan)
 from fastapi.responses import PlainTextResponse
 
+
+
 @app.api_route("/uptime", methods=["GET", "HEAD"])
 async def uptime():
     return PlainTextResponse("ok")
 
 
-@app.get("/")
-async def root():
-    connected = bool(tg_client and tg_client.is_connected())
-    return {
-        "status": "ok",
-        "service": "raven-userbot",
-        "telegram_connected": connected,
-        "plugins_loaded": sorted(plugin_loader.loaded.keys()),
-    }
+
 
 
 @app.get("/health")
@@ -240,14 +234,7 @@ async def health():
     return {"status": "healthy" if tg_client and tg_client.is_connected() else "starting"}
 
 
-@app.get("/uptime")
-async def uptime():
-    return {
-        "status": "ok",
-        "service": "raven-userbot",
-        "keepalive": Config.UPTIME_ENABLED,
-        "telegram_connected": bool(tg_client and tg_client.is_connected()),
-    }
+
 
 
 if __name__ == "__main__":
