@@ -111,6 +111,10 @@ def _manifest_path() -> Path:
     return _cache_root() / _CACHE_MANIFEST
 
 
+def _local_plugins_dir() -> Path:
+    return Path(Config.LOCAL_PLUGIN_DIR).expanduser()
+
+
 def _safe_stem(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_\-]", "_", name).strip("_") or "plugin"
 
@@ -134,6 +138,13 @@ def cache_exists() -> bool:
         if _cache_file_path(name).exists():
             return True
     return False
+
+
+def local_plugins_available() -> bool:
+    plugin_dir = _local_plugins_dir()
+    if not plugin_dir.exists() or not plugin_dir.is_dir():
+        return False
+    return any(path.is_file() and path.suffix == ".py" and not path.name.startswith("_") for path in plugin_dir.iterdir())
 
 
 def _read_manifest() -> dict[str, Any]:
@@ -194,6 +205,31 @@ def _load_cached_catalog() -> list[CachedPlugin]:
             )
         )
     return cached
+
+
+def _load_local_catalog() -> list[CachedPlugin]:
+    plugin_dir = _local_plugins_dir()
+    allowlist = {name.lower() for name in Config.PLUGIN_ALLOWLIST}
+    if not plugin_dir.exists() or not plugin_dir.is_dir():
+        return []
+
+    plugins: list[CachedPlugin] = []
+    for path in sorted(plugin_dir.glob("*.py")):
+        if path.name.startswith("_"):
+            continue
+        name = path.stem
+        if allowlist and name.lower() not in allowlist:
+            continue
+        stat = path.stat()
+        plugins.append(
+            CachedPlugin(
+                name=name,
+                sha=f"local:{stat.st_mtime_ns}",
+                source_url=path.resolve().as_uri(),
+                cache_path=path.resolve(),
+            )
+        )
+    return plugins
 
 
 def _persist_remote_catalog(plugins: list[dict[str, str]], plugin_code_map: dict[str, str]) -> list[CachedPlugin]:
@@ -384,28 +420,56 @@ async def _download_and_cache_from_github() -> list[CachedPlugin]:
 async def sync_plugins(client, *, force_remote: bool = False) -> SyncSummary:
     async with _sync_lock:
         has_cache = cache_exists()
-        use_remote = force_remote or not has_cache
+        has_local = local_plugins_available()
+        has_repo = bool(Config.PLUGIN_SOURCE_REPO)
 
-        if use_remote:
+        if force_remote:
+            if has_repo:
+                try:
+                    cached_plugins = await _download_and_cache_from_github()
+                    summary = await _reconcile_cached_plugins(cached_plugins, client, "github")
+                    summary.remote_attempted = True
+                    return summary
+                except Exception as exc:
+                    remote_error = str(exc)
+                    if has_cache:
+                        log.warning("GitHub sync xətası, cache istifadə olunur: %s", remote_error)
+                        cached_plugins = _load_cached_catalog()
+                        summary = await _reconcile_cached_plugins(cached_plugins, client, "cache-fallback")
+                    elif has_local:
+                        log.warning("GitHub sync xətası, local pluginlər istifadə olunur: %s", remote_error)
+                        cached_plugins = _load_local_catalog()
+                        summary = await _reconcile_cached_plugins(cached_plugins, client, "local-fallback")
+                    else:
+                        summary = await _reconcile_cached_plugins([], client, "empty")
+                    summary.remote_attempted = True
+                    summary.remote_error = remote_error
+                    return summary
+
+            summary = await _reconcile_cached_plugins(_load_local_catalog() if has_local else _load_cached_catalog(), client, "local" if has_local else "cache")
+            summary.remote_attempted = True
+            summary.remote_error = "PLUGIN_SOURCE_REPO təyin edilməyib"
+            return summary
+
+        if has_cache:
+            return await _reconcile_cached_plugins(_load_cached_catalog(), client, "cache")
+
+        if has_local:
+            return await _reconcile_cached_plugins(_load_local_catalog(), client, "local")
+
+        if has_repo:
             try:
                 cached_plugins = await _download_and_cache_from_github()
                 summary = await _reconcile_cached_plugins(cached_plugins, client, "github")
                 summary.remote_attempted = True
                 return summary
             except Exception as exc:
-                remote_error = str(exc)
-                if has_cache:
-                    log.warning("GitHub sync xətası, cache istifadə olunur: %s", remote_error)
-                else:
-                    log.warning("GitHub sync xətası, cache yoxdur: %s", remote_error)
-                cached_plugins = _load_cached_catalog()
-                summary = await _reconcile_cached_plugins(cached_plugins, client, "cache-fallback")
+                summary = await _reconcile_cached_plugins([], client, "empty")
                 summary.remote_attempted = True
-                summary.remote_error = remote_error
+                summary.remote_error = str(exc)
                 return summary
 
-        cached_plugins = _load_cached_catalog()
-        return await _reconcile_cached_plugins(cached_plugins, client, "cache")
+        return await _reconcile_cached_plugins([], client, "empty")
 
 
 async def load_all(client):
@@ -429,6 +493,9 @@ async def start_background_sync(client):
     global _sync_task
     if not Config.PLUGIN_AUTO_SYNC:
         log.info("ℹ️ Avtomatik GitHub plugin sync söndürülüb")
+        return None
+    if not Config.PLUGIN_SOURCE_REPO:
+        log.info("ℹ️ PLUGIN_SOURCE_REPO yoxdur, background sync local/cache ilə davam edir")
         return None
     if _sync_task and not _sync_task.done():
         return _sync_task
