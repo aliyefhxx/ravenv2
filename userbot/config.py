@@ -7,6 +7,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+BASE_DIR = Path(__file__).resolve().parent
+REPO_DIR = BASE_DIR.parent
+
+
 def _detect_repo_from_git() -> str:
     candidates = [
         os.getenv("PLUGIN_SOURCE_REPO", "").strip(),
@@ -17,7 +21,7 @@ def _detect_repo_from_git() -> str:
         if candidate:
             return candidate.replace("https://github.com/", "").replace(".git", "").strip("/")
 
-    git_config = Path(__file__).resolve().parents[1] / ".git" / "config"
+    git_config = REPO_DIR / ".git" / "config"
     if git_config.exists():
         try:
             text = git_config.read_text(encoding="utf-8", errors="ignore")
@@ -51,7 +55,35 @@ def _default_plugin_cache_dir() -> str:
     if render_disk_fallback.exists() and render_disk_fallback.is_dir():
         return str(render_disk_fallback / "raven-plugin-cache")
 
-    return str((Path(__file__).resolve().parent / ".plugin_cache").resolve())
+    return str((BASE_DIR / ".plugin_cache").resolve())
+
+
+def _default_local_plugin_dir() -> str:
+    explicit = os.getenv("LOCAL_PLUGIN_DIR", "").strip()
+    if explicit:
+        return str(Path(explicit).expanduser())
+
+    candidates = [
+        REPO_DIR / "github_plugins",
+        BASE_DIR / "plugins",
+    ]
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_dir():
+            return str(candidate.resolve())
+
+    return str((REPO_DIR / "github_plugins").resolve())
+
+
+def _detect_public_base_url() -> str:
+    candidates = [
+        os.getenv("APP_BASE_URL", "").strip(),
+        os.getenv("RENDER_EXTERNAL_URL", "").strip(),
+        os.getenv("RENDER_PUBLIC_URL", "").strip(),
+    ]
+    for candidate in candidates:
+        if candidate:
+            return candidate.rstrip("/")
+    return ""
 
 
 class Config:
@@ -73,3 +105,13 @@ class Config:
     PLUGIN_ALLOWLIST = [
         item.strip() for item in os.getenv("PLUGIN_ALLOWLIST", "").split(",") if item.strip()
     ]
+    LOCAL_PLUGIN_DIR = _default_local_plugin_dir()
+
+    MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
+    MONGODB_DB = os.getenv("MONGODB_DB", "raven_userbot").strip() or "raven_userbot"
+
+    APP_BASE_URL = _detect_public_base_url()
+    UPTIME_URL = os.getenv("UPTIME_URL", "").strip()
+    UPTIME_ENABLED = os.getenv("UPTIME_ENABLED", "1") == "1"
+    UPTIME_INTERVAL_SECONDS = max(60, int(os.getenv("UPTIME_INTERVAL_SECONDS", "240")))
+    UPTIME_USER_AGENT = os.getenv("UPTIME_USER_AGENT", "RavenUserbotKeepAlive/1.0").strip() or "RavenUserbotKeepAlive/1.0"
