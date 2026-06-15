@@ -29,6 +29,51 @@ log = logging.getLogger("raven")
 tg_client: TelegramClient | None = None
 
 
+def _install_extra_emoji_patches():
+    if getattr(TelegramClient, "_raven_extra_emoji_patch", False):
+        return
+
+    injector = getattr(emoji_utils, "_inject_entities", None)
+    if injector is None:
+        return
+
+    base_send_message = getattr(emoji_utils, "_orig_send_message", TelegramClient.send_message)
+    base_send_file = TelegramClient.send_file
+    base_edit_message = TelegramClient.edit_message
+
+    def _prepare_text_payload(raw_text: str | None, kwargs: dict):
+        if not isinstance(raw_text, str):
+            return raw_text, kwargs
+        parse_mode = kwargs.pop("parse_mode", None)
+        base_entities = kwargs.pop("formatting_entities", None) or kwargs.pop("entities", None)
+        text, entities = injector(raw_text, base_entities, parse_mode)
+        kwargs["formatting_entities"] = entities
+        return text, kwargs
+
+    async def _patched_send_message(self, entity, message="", *args, **kwargs):
+        message, kwargs = _prepare_text_payload(message, kwargs)
+        return await base_send_message(self, entity, message, *args, **kwargs)
+
+    async def _patched_send_file(self, entity, file, *args, **kwargs):
+        caption = kwargs.get("caption")
+        caption, kwargs = _prepare_text_payload(caption, kwargs)
+        kwargs["caption"] = caption
+        return await base_send_file(self, entity, file, *args, **kwargs)
+
+    async def _patched_edit_message(self, entity, message=None, text=None, *args, **kwargs):
+        if isinstance(text, str):
+            text, kwargs = _prepare_text_payload(text, kwargs)
+        return await base_edit_message(self, entity, message, text=text, *args, **kwargs)
+
+    TelegramClient.send_message = _patched_send_message
+    TelegramClient.send_file = _patched_send_file
+    TelegramClient.edit_message = _patched_edit_message
+    TelegramClient._raven_extra_emoji_patch = True
+
+
+_install_extra_emoji_patches()
+
+
 def get_session_string() -> str:
     raw = Config.SESSION_STRING
     if not raw:
